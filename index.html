@@ -1144,7 +1144,7 @@
           text.innerText = 'RTX 4070 Ti (LOCAL GPU)';
           badge.className = 'engine-mode-badge gpu';
           badgeDot.className = 'status-dot online';
-          badgeText.innerText = '🚀 Local Server Online • RTX 4070 Ti CUDA (Real-ESRGAN + RMBG-1.4)';
+          badgeText.innerText = '🚀 Local Server Online • RTX 4070 Ti (Waifu2x CUnet & RMBG-1.4)';
           statDevice.innerText = 'Device: ' + data.gpu + ' (' + data.vram + ')';
           return;
         }
@@ -1170,7 +1170,7 @@
       document.getElementById('bg-controls').style.display = tab === 'bg' ? 'flex' : 'none';
 
       const engineTag = document.getElementById('engine-tag');
-      if (tab === 'upscale') engineTag.innerText = isServerOnline ? 'Real-ESRGAN-Anime6B (CUDA) • READY' : 'High-Punch Linework Upscaler • READY';
+      if (tab === 'upscale') engineTag.innerText = isServerOnline ? 'Waifu2x-CUnet (RTX 4070 Ti) • READY' : 'High-Punch Linework Upscaler • READY';
       else if (tab === 'bg') engineTag.innerText = isServerOnline ? 'BRIA AI RMBG-1.4 (Pixelcut Tier) • READY' : 'In-Browser Precision Matting • READY';
 
       // Switch viewer mode

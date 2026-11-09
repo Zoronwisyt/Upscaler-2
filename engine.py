@@ -2,6 +2,8 @@ import os
 import io
 import math
 import time
+import tempfile
+import subprocess
 import urllib.request
 from pathlib import Path
 from PIL import Image, ImageFilter, ImageOps, ImageEnhance
@@ -13,6 +15,10 @@ import torch.nn.functional as F
 MODELS_DIR = Path.home() / ".cache" / "kuroline" / "weights"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
+WAIFU2X_DIR = Path.home() / ".cache" / "kuroline" / "waifu2x"
+WAIFU2X_EXE = WAIFU2X_DIR / "waifu2x-ncnn-vulkan_waifu2xEX.exe"
+CUNET_MODELS = WAIFU2X_DIR / "models-cunet"
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[Ritmada Engine] Initialized on device: {DEVICE}")
 if DEVICE.type == "cuda":
@@ -20,7 +26,7 @@ if DEVICE.type == "cuda":
 
 
 # -------------------------------------------------------------
-# 1. Real-ESRGAN RRDBNet (Anime 6B) Super-Resolution
+# 1. Waifu2x CUnet & Real-ESRGAN Anime Super-Resolution
 # -------------------------------------------------------------
 class ResidualDenseBlock(nn.Module):
     def __init__(self, num_feat=64, num_grow_ch=32):
@@ -81,42 +87,41 @@ class RRDBNet(nn.Module):
 
 class AnimeUpscaler:
     def __init__(self):
-        self.model = None
+        self.waifu2x_available = WAIFU2X_EXE.exists() and CUNET_MODELS.exists()
+        self.realesrgan_model = None
         self.model_loaded = False
-        self.weights_path = MODELS_DIR / "RealESRGAN_x4plus_anime_6B.pth"
-        self._init_model()
+        self.engine_name = "Waifu2x-CUnet" if self.waifu2x_available else "Real-ESRGAN"
 
-    def _init_model(self):
+        if self.waifu2x_available:
+            print("[AnimeUpscaler] Native Waifu2x CUnet models active (Vulkan/CUDA).")
+            self.model_loaded = True
+        else:
+            self._init_realesrgan()
+
+    def _init_realesrgan(self):
         try:
-            self.model = RRDBNet(num_in_ch=3, num_out_ch=3, scale=4, num_feat=64, num_block=6, num_grow_ch=32)
+            self.weights_path = MODELS_DIR / "RealESRGAN_x4plus_anime_6B.pth"
+            self.realesrgan_model = RRDBNet(num_in_ch=3, num_out_ch=3, scale=4, num_feat=64, num_block=6, num_grow_ch=32)
             if not self.weights_path.exists():
                 url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth"
                 print(f"[AnimeUpscaler] Downloading RealESRGAN_x4plus_anime_6B weights...")
                 urllib.request.urlretrieve(url, str(self.weights_path))
-                print(f"[AnimeUpscaler] Download completed.")
 
             loadnet = torch.load(str(self.weights_path), map_location="cpu", weights_only=True)
-            if "params_ema" in loadnet:
-                keyname = "params_ema"
-            elif "params" in loadnet:
-                keyname = "params"
-            else:
-                keyname = None
-
+            keyname = "params_ema" if "params_ema" in loadnet else ("params" if "params" in loadnet else None)
             state_dict = loadnet[keyname] if keyname else loadnet
-            self.model.load_state_dict(state_dict, strict=True)
-            self.model.eval().to(DEVICE)
+            self.realesrgan_model.load_state_dict(state_dict, strict=True)
+            self.realesrgan_model.eval().to(DEVICE)
             self.model_loaded = True
             print("[AnimeUpscaler] Real-ESRGAN anime-6B weights loaded successfully.")
         except Exception as e:
-            print(f"[AnimeUpscaler] Neural weights load notice: {e}. Active neural fallback initialized.")
-            self.model = None
+            print(f"[AnimeUpscaler] Fallback to high-order inking upscaler: {e}")
+            self.realesrgan_model = None
             self.model_loaded = False
 
-    @torch.no_grad()
     def upscale(self, img: Image.Image, scale: int = 4) -> Image.Image:
         """
-        Upscales an anime PIL Image by 2x or 4x with noticeable, punchy vector-sharp inking.
+        Upscales an anime PIL Image by 2x or 4x using Waifu2x CUnet or Real-ESRGAN.
         """
         orig_mode = img.mode
         alpha = None
@@ -126,68 +131,111 @@ class AnimeUpscaler:
         else:
             img_rgb = img.convert("RGB")
 
-        if self.model_loaded and self.model is not None:
-            # Neural Real-ESRGAN inference with tiling
-            img_np = np.array(img_rgb).astype(np.float32) / 255.0
-            tensor = torch.from_numpy(img_np.transpose((2, 0, 1))).unsqueeze(0).to(DEVICE)
+        # Path A: Waifu2x CUnet (Highest anime fidelity)
+        if self.waifu2x_available:
+            try:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    in_path = os.path.join(tmpdir, "in.png")
+                    out_path = os.path.join(tmpdir, "out.png")
+                    img_rgb.save(in_path, "PNG")
 
-            b, c, h, w = tensor.shape
-            tile_size = 512
-            tile_pad = 16
+                    # First pass (2x)
+                    cmd1 = [
+                        str(WAIFU2X_EXE),
+                        "-i", in_path,
+                        "-o", out_path,
+                        "-s", "2",
+                        "-n", "2",
+                        "-m", str(CUNET_MODELS)
+                    ]
+                    subprocess.run(cmd1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-            if h <= tile_size and w <= tile_size:
-                output = self.model(tensor)
-            else:
-                output = torch.zeros((b, c, h * 4, w * 4), device=DEVICE)
-                for y in range(0, h, tile_size):
-                    for x in range(0, w, tile_size):
-                        y_start = max(0, y - tile_pad)
-                        y_end = min(h, y + tile_size + tile_pad)
-                        x_start = max(0, x - tile_pad)
-                        x_end = min(w, x + tile_size + tile_pad)
+                    if scale == 4:
+                        # Second pass for 4x
+                        in_path2 = out_path
+                        out_path2 = os.path.join(tmpdir, "out4x.png")
+                        cmd2 = [
+                            str(WAIFU2X_EXE),
+                            "-i", in_path2,
+                            "-o", out_path2,
+                            "-s", "2",
+                            "-n", "1",
+                            "-m", str(CUNET_MODELS)
+                        ]
+                        subprocess.run(cmd2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                        out_img = Image.open(out_path2).copy()
+                    else:
+                        out_img = Image.open(out_path).copy()
 
-                        in_patch = tensor[:, :, y_start:y_end, x_start:x_end]
-                        out_patch = self.model(in_patch)
+                    # Apply vector inking pass
+                    out_img = self._apply_inking(out_img)
+                    if alpha is not None:
+                        alpha_up = alpha.resize(out_img.size, Image.Resampling.LANCZOS)
+                        out_img.putalpha(alpha_up)
+                    return out_img
+            except Exception as e:
+                print(f"[AnimeUpscaler] Waifu2x subprocess notice: {e}. Using Real-ESRGAN.")
 
-                        out_y_start = (y - y_start) * 4
-                        out_y_end = out_y_start + (min(h, y + tile_size) - y) * 4
-                        out_x_start = (x - x_start) * 4
-                        out_x_end = out_x_start + (min(w, x + tile_size) - x) * 4
+        # Path B: PyTorch Real-ESRGAN
+        if self.realesrgan_model is not None:
+            with torch.no_grad():
+                img_np = np.array(img_rgb).astype(np.float32) / 255.0
+                tensor = torch.from_numpy(img_np.transpose((2, 0, 1))).unsqueeze(0).to(DEVICE)
+                b, c, h, w = tensor.shape
+                tile_size = 512
+                tile_pad = 16
 
-                        patch_crop = out_patch[:, :, out_y_start:out_y_end, out_x_start:out_x_end]
-                        target_y = y * 4
-                        target_x = x * 4
-                        output[:, :, target_y:target_y + patch_crop.shape[2], target_x:target_x + patch_crop.shape[3]] = patch_crop
+                if h <= tile_size and w <= tile_size:
+                    output = self.realesrgan_model(tensor)
+                else:
+                    output = torch.zeros((b, c, h * 4, w * 4), device=DEVICE)
+                    for y in range(0, h, tile_size):
+                        for x in range(0, w, tile_size):
+                            y_start = max(0, y - tile_pad)
+                            y_end = min(h, y + tile_size + tile_pad)
+                            x_start = max(0, x - tile_pad)
+                            x_end = min(w, x + tile_size + tile_pad)
 
-            output = output.squeeze(0).clamp(0, 1).cpu().numpy().transpose((1, 2, 0))
-            out_img = Image.fromarray((output * 255.0).round().astype(np.uint8))
+                            in_patch = tensor[:, :, y_start:y_end, x_start:x_end]
+                            out_patch = self.realesrgan_model(in_patch)
 
-            if scale == 2:
-                out_img = out_img.resize((img.width * 2, img.height * 2), Image.Resampling.LANCZOS)
+                            out_y_start = (y - y_start) * 4
+                            out_y_end = out_y_start + (min(h, y + tile_size) - y) * 4
+                            out_x_start = (x - x_start) * 4
+                            out_x_end = out_x_start + (min(w, x + tile_size) - x) * 4
+
+                            patch_crop = out_patch[:, :, out_y_start:out_y_end, out_x_start:out_x_end]
+                            target_y = y * 4
+                            target_x = x * 4
+                            output[:, :, target_y:target_y + patch_crop.shape[2], target_x:target_x + patch_crop.shape[3]] = patch_crop
+
+                output = output.squeeze(0).clamp(0, 1).cpu().numpy().transpose((1, 2, 0))
+                out_img = Image.fromarray((output * 255.0).round().astype(np.uint8))
+                if scale == 2:
+                    out_img = out_img.resize((img.width * 2, img.height * 2), Image.Resampling.LANCZOS)
         else:
-            # High-Order Lanczos
-            target_w = img.width * scale
-            target_h = img.height * scale
-            out_img = img_rgb.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            out_img = img_rgb.resize((img.width * scale, img.height * scale), Image.Resampling.LANCZOS)
 
-        # Post-Processing: Punchy Anime Linework Pop & Vector Edge Sharpening
-        # Gives immediate visual distinction between blurry low-res and crisp 4K
-        sharp = out_img.filter(ImageFilter.UnsharpMask(radius=2, percent=180, threshold=2))
-        enh_contrast = ImageEnhance.Contrast(sharp).enhance(1.10)
-        enh_color = ImageEnhance.Color(enh_contrast).enhance(1.06)
-
-        # Inking pass: deepen darker lines for high-contrast anime vector look
-        arr = np.array(enh_color).astype(np.float32)
-        gray = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
-        line_mask = (gray < 155)
-        arr[line_mask] = np.clip(arr[line_mask] * 0.88, 0, 255)
-        out_img = Image.fromarray(arr.astype(np.uint8))
-
+        out_img = self._apply_inking(out_img)
         if alpha is not None:
             alpha_up = alpha.resize(out_img.size, Image.Resampling.LANCZOS)
             out_img.putalpha(alpha_up)
 
         return out_img
+
+    def _apply_inking(self, img_rgb: Image.Image) -> Image.Image:
+        """
+        Enhances line contrast and unsharp edge definition for dramatic vector clarity.
+        """
+        sharp = img_rgb.filter(ImageFilter.UnsharpMask(radius=2, percent=180, threshold=2))
+        enh_contrast = ImageEnhance.Contrast(sharp).enhance(1.10)
+        enh_color = ImageEnhance.Color(enh_contrast).enhance(1.06)
+
+        arr = np.array(enh_color).astype(np.float32)
+        gray = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+        line_mask = (gray < 155)
+        arr[line_mask] = np.clip(arr[line_mask] * 0.88, 0, 255)
+        return Image.fromarray(arr.astype(np.uint8))
 
 
 # -------------------------------------------------------------
