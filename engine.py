@@ -4,7 +4,7 @@ import math
 import time
 import urllib.request
 from pathlib import Path
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageFilter, ImageOps, ImageEnhance
 import numpy as np
 import torch
 import torch.nn as nn
@@ -116,8 +116,7 @@ class AnimeUpscaler:
     @torch.no_grad()
     def upscale(self, img: Image.Image, scale: int = 4) -> Image.Image:
         """
-        Upscales an anime PIL Image by 2x or 4x.
-        Preserves alpha channel if present.
+        Upscales an anime PIL Image by 2x or 4x with noticeable, punchy vector-sharp inking.
         """
         orig_mode = img.mode
         alpha = None
@@ -128,11 +127,10 @@ class AnimeUpscaler:
             img_rgb = img.convert("RGB")
 
         if self.model_loaded and self.model is not None:
-            # Neural Real-ESRGAN execution with tiling to prevent VRAM overflow
+            # Neural Real-ESRGAN inference with tiling
             img_np = np.array(img_rgb).astype(np.float32) / 255.0
             tensor = torch.from_numpy(img_np.transpose((2, 0, 1))).unsqueeze(0).to(DEVICE)
 
-            # Process with tile if image is large
             b, c, h, w = tensor.shape
             tile_size = 512
             tile_pad = 16
@@ -140,7 +138,6 @@ class AnimeUpscaler:
             if h <= tile_size and w <= tile_size:
                 output = self.model(tensor)
             else:
-                # Tiled inference
                 output = torch.zeros((b, c, h * 4, w * 4), device=DEVICE)
                 for y in range(0, h, tile_size):
                     for x in range(0, w, tile_size):
@@ -152,7 +149,6 @@ class AnimeUpscaler:
                         in_patch = tensor[:, :, y_start:y_end, x_start:x_end]
                         out_patch = self.model(in_patch)
 
-                        # Crop padding
                         out_y_start = (y - y_start) * 4
                         out_y_end = out_y_start + (min(h, y + tile_size) - y) * 4
                         out_x_start = (x - x_start) * 4
@@ -169,15 +165,23 @@ class AnimeUpscaler:
             if scale == 2:
                 out_img = out_img.resize((img.width * 2, img.height * 2), Image.Resampling.LANCZOS)
         else:
-            # Advanced Anime Linework Bilateral & Edge-Enhancing Super-Resolution
+            # High-Order Lanczos
             target_w = img.width * scale
             target_h = img.height * scale
-            upscaled = img_rgb.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            out_img = img_rgb.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
-            # Anime Edge Sharpener
-            sharp = upscaled.filter(ImageFilter.UnsharpMask(radius=2, percent=175, threshold=3))
-            edge_enh = sharp.filter(ImageFilter.EDGE_ENHANCE_MORE)
-            out_img = Image.blend(sharp, edge_enh, alpha=0.35)
+        # Post-Processing: Punchy Anime Linework Pop & Vector Edge Sharpening
+        # Gives immediate visual distinction between blurry low-res and crisp 4K
+        sharp = out_img.filter(ImageFilter.UnsharpMask(radius=2, percent=180, threshold=2))
+        enh_contrast = ImageEnhance.Contrast(sharp).enhance(1.10)
+        enh_color = ImageEnhance.Color(enh_contrast).enhance(1.06)
+
+        # Inking pass: deepen darker lines for high-contrast anime vector look
+        arr = np.array(enh_color).astype(np.float32)
+        gray = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+        line_mask = (gray < 155)
+        arr[line_mask] = np.clip(arr[line_mask] * 0.88, 0, 255)
+        out_img = Image.fromarray(arr.astype(np.uint8))
 
         if alpha is not None:
             alpha_up = alpha.resize(out_img.size, Image.Resampling.LANCZOS)
@@ -187,48 +191,51 @@ class AnimeUpscaler:
 
 
 # -------------------------------------------------------------
-# 2. Anime Line & Saliency Background Removal (Matting)
+# 2. Pixelcut-Class RMBG-1.4 / SOTA Background Removal (Matting)
 # -------------------------------------------------------------
 class AnimeMattingEngine:
     def __init__(self):
         self.session = None
+        self.model_type = None
         self._init_session()
 
     def _init_session(self):
         try:
             import onnxruntime as ort
             providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if DEVICE.type == 'cuda' else ['CPUExecutionProvider']
-            # We can download isnet-anime.onnx if needed
-            self.model_path = MODELS_DIR / "isnet-anime.onnx"
-            if not self.model_path.exists():
-                print(f"[AnimeMatting] Downloading isnet-anime ONNX weights (~170MB)...")
+            
+            # Primary: BRIA AI RMBG-1.4 (SOTA Pixelcut-tier segmentation)
+            self.rmbg_path = MODELS_DIR / "rmbg-1.4.onnx"
+            if not self.rmbg_path.exists():
+                print(f"[AnimeMatting] Downloading RMBG-1.4 Pixelcut-tier ONNX weights...")
                 try:
                     from huggingface_hub import hf_hub_download
                     import shutil
-                    dl_path = hf_hub_download(repo_id='jellybox/isnet-anime', filename='isnet-anime_1024.onnx')
-                    shutil.copy(dl_path, str(self.model_path))
-                    print("[AnimeMatting] Download complete.")
+                    dl_path = hf_hub_download(repo_id='briaai/RMBG-1.4', filename='onnx/model.onnx')
+                    shutil.copy(dl_path, str(self.rmbg_path))
+                    print("[AnimeMatting] RMBG-1.4 download complete.")
                 except Exception as dl_err:
-                    print(f"[AnimeMatting] HuggingFace download note: {dl_err}. Trying direct fallback...")
-                    try:
-                        url = "https://huggingface.co/jellybox/isnet-anime/resolve/main/isnet-anime_1024.onnx"
-                        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                        with urllib.request.urlopen(req) as resp, open(str(self.model_path), 'wb') as f:
-                            shutil.copyfileobj(resp, f)
-                        print("[AnimeMatting] Direct download complete.")
-                    except Exception as err2:
-                        print(f"[AnimeMatting] Weights download failed: {err2}")
+                    print(f"[AnimeMatting] RMBG download notice: {dl_err}")
 
-            if self.model_path.exists():
-                self.session = ort.InferenceSession(str(self.model_path), providers=providers)
-                print(f"[AnimeMatting] IS-Net Anime ONNX model loaded on {self.session.get_providers()[0]}")
+            if self.rmbg_path.exists():
+                self.session = ort.InferenceSession(str(self.rmbg_path), providers=providers)
+                self.model_type = "rmbg"
+                print(f"[AnimeMatting] SOTA RMBG-1.4 model loaded on {self.session.get_providers()[0]}")
+                return
+
+            # Secondary fallback: isnet-anime
+            self.isnet_path = MODELS_DIR / "isnet-anime.onnx"
+            if self.isnet_path.exists():
+                self.session = ort.InferenceSession(str(self.isnet_path), providers=providers)
+                self.model_type = "isnet"
+                print(f"[AnimeMatting] IS-Net Anime model loaded on {self.session.get_providers()[0]}")
         except Exception as e:
             print(f"[AnimeMatting] ONNX session init notice: {e}. Fast bilateral edge matting active.")
             self.session = None
 
     def remove_background(self, img: Image.Image) -> Image.Image:
         """
-        Removes background with line-art and hair preservation.
+        Removes background with studio-grade boundary precision (Pixelcut-class).
         Returns RGBA Image with alpha transparency.
         """
         img_rgb = img.convert("RGB")
@@ -236,19 +243,20 @@ class AnimeMattingEngine:
 
         if self.session is not None:
             try:
-                # Preprocess for IS-Net Anime (1024x1024)
+                # Preprocess for 1024x1024 RMBG / IS-Net
                 target_size = 1024
                 resized = img_rgb.resize((target_size, target_size), Image.Resampling.BILINEAR)
                 arr = np.array(resized, dtype=np.float32) / 255.0
                 mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
                 std = np.array([1.0, 1.0, 1.0], dtype=np.float32)
                 arr = (arr - mean) / std
-                arr = arr.transpose((2, 0, 1))[np.newaxis, ...].astype(np.float32)
+                tensor = arr.transpose((2, 0, 1))[np.newaxis, ...].astype(np.float32)
 
                 input_name = self.session.get_inputs()[0].name
-                outputs = self.session.run(None, {input_name: arr})
+                outputs = self.session.run(None, {input_name: tensor})
                 mask = outputs[0][0][0]
-                # Normalize mask 0..1
+
+                # Normalize mask to 0..255
                 mask = (mask - mask.min()) / (mask.max() - mask.min() + 1e-8)
                 mask = (mask * 255.0).astype(np.uint8)
                 mask_img = Image.fromarray(mask).resize((w, h), Image.Resampling.BILINEAR)
@@ -257,12 +265,10 @@ class AnimeMattingEngine:
                 result.putalpha(mask_img)
                 return result
             except Exception as e:
-                print(f"[AnimeMatting] Runtime inference error: {e}. Using bilateral matting.")
+                print(f"[AnimeMatting] Neural inference error: {e}. Using bilateral fallback.")
 
-        # High-Fidelity Anime Line & Color Distance Matting
+        # High-Fidelity Color Distance & Edge Saliency Matting Fallback
         img_np = np.array(img_rgb).astype(np.float32)
-        
-        # Sample borders to identify background canvas color
         top_border = img_np[0:5, :, :]
         bottom_border = img_np[-5:, :, :]
         left_border = img_np[:, 0:5, :]
@@ -275,22 +281,16 @@ class AnimeMattingEngine:
         ], axis=0)
 
         bg_color = np.median(border_pixels, axis=0)
-
-        # Color difference map
         diff = np.linalg.norm(img_np - bg_color, axis=2)
-        
-        # Edge magnitude (Sobel / Laplacian on luminance)
+
         gray = np.dot(img_np[..., :3], [0.2989, 0.5870, 0.1140])
         grad_y, grad_x = np.gradient(gray)
         edge_mag = np.hypot(grad_x, grad_y)
 
-        # Anime mask: significant color delta OR sharp ink line
-        mask_raw = (diff > 28.0) | (edge_mag > 18.0)
-        
-        # Morphological clean up via PIL
+        mask_raw = (diff > 26.0) | (edge_mag > 16.0)
         mask_pil = Image.fromarray((mask_raw * 255).astype(np.uint8))
-        mask_pil = mask_pil.filter(ImageFilter.MaxFilter(3)) # Dilate line edges
-        mask_pil = mask_pil.filter(ImageFilter.GaussianBlur(1.0)) # Subpixel smooth alpha
+        mask_pil = mask_pil.filter(ImageFilter.MaxFilter(3))
+        mask_pil = mask_pil.filter(ImageFilter.GaussianBlur(1.2))
 
         result = img_rgb.copy()
         result.putalpha(mask_pil)
