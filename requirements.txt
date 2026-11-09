@@ -1,0 +1,11 @@
+torch>=2.0.0
+torchvision>=0.15.0
+numpy<2.0.0
+pillow>=10.0.0
+fastapi>=0.110.0
+uvicorn>=0.28.0
+python-multipart>=0.0.9
+aiofiles>=23.2.0
+opencv-python-headless>=4.9.0
+onnxruntime>=1.17.0
+huggingface_hub>=0.20.0
